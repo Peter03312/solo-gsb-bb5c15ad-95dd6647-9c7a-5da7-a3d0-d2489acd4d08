@@ -369,15 +369,7 @@ def test_superseded_plan_rejected_409_but_existing_cert_readable(client):
     assert h.status_code == 201
     hid = h.json()["handover_id"]
 
-    client.post("/api/manifest-revisions", json={
-        "containers": [{"no": "C001", "weight": 15, "hazmat": None,
-                        "discharge_order": 1}]
-    })
-    p2 = client.post(f"/api/plans/{pid}/amend", json={}).json()
-    ok = client.post(f"/api/plans/{p2['plan_id']}/confirm", json={
-        "slots_revision": 1, "manifest_revision": 2
-    })
-    assert ok.status_code == 200
+    p2 = _supersede(client, pid)
 
     r = client.post(f"/api/plans/{pid}/handovers", json=_handover_body("H-x"))
     assert r.status_code == 409 and "取代" in r.json()["detail"]
@@ -385,6 +377,152 @@ def test_superseded_plan_rejected_409_but_existing_cert_readable(client):
     g = client.get(f"/api/handovers/{hid}")
     assert g.status_code == 200
     assert g.json()["handover_id"] == hid
+
+
+def test_original_request_resend_after_supersede_returns_cert_200(client):
+    """方案被新修订确认取代后，现场用原交接号重发同一申请：
+
+    交接号、方案、截止分钟、期望实绩版本、有效流水号集合、最大完工延误阈值
+    六项均与首次签发一致 -> 200 返回原凭证（而非按旧方案状态 409）；
+    不可变签发内容保持原样。
+    """
+    plan = _finished_stack(client)
+    pid = plan["plan_id"]
+    h1 = client.post(f"/api/plans/{pid}/handovers", json=_handover_body())
+    assert h1.status_code == 201
+    hid = h1.json()["handover_id"]
+    frozen = h1.json()
+
+    _supersede(client, pid)
+
+    r = client.post(f"/api/plans/{pid}/handovers", json=_handover_body())
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["handover_id"] == hid
+    # 不可变签发内容保持原样
+    assert data["handover_no"] == frozen["handover_no"]
+    assert data["revision_no"] == frozen["revision_no"]
+    assert data["actual_version"] == frozen["actual_version"] == 1
+    assert data["actuals_fingerprint"] == frozen["actuals_fingerprint"]
+    assert data["valid_seqs"] == [1, 2, 3, 4]
+    assert data["cutoff_minute"] == 30
+    assert data["max_finish_delay_minutes"] == 5
+    c2 = next(c for c in data["containers"] if c["container_no"] == "C002")
+    assert c2["actual_finish_minute"] == 20
+    # 不新增凭证
+    assert len(client.get(f"/api/plans/{pid}/handovers").json()) == 1
+
+
+def test_resend_after_supersede_and_correction_marks_current_state(client):
+    """方案取代且实绩后来更正后，同号同内容重发：200 原凭证，
+
+    凭证内容仍为首次签发快照；matches_current_actuals 按查询时状态计算。
+    """
+    plan = _finished_stack(client)
+    pid = plan["plan_id"]
+    h1 = client.post(f"/api/plans/{pid}/handovers", json=_handover_body())
+    assert h1.status_code == 201
+    hid = h1.json()["handover_id"]
+    frozen_fingerprint = h1.json()["actuals_fingerprint"]
+
+    # 先更正实绩（版本 2），再取代方案
+    cc = client.post(f"/api/plans/{pid}/actual-events/correction", json={
+        "seq": 4, "expected_version": 1, "request_id": "CORR-1",
+        "event": {"seq": 4, "event_type": "finish", "container_no": "C002",
+                  "crane_no": 2, "minute": 19},
+    })
+    assert cc.status_code == 201
+    _supersede(client, pid)
+
+    r = client.post(f"/api/plans/{pid}/handovers", json=_handover_body())
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["handover_id"] == hid
+    # 固化内容仍是版本 1、旧指纹、旧分钟
+    assert data["actual_version"] == 1
+    assert data["actuals_fingerprint"] == frozen_fingerprint
+    c2 = next(c for c in data["containers"] if c["container_no"] == "C002")
+    assert c2["actual_finish_minute"] == 20
+    # 当前实绩匹配标记按查询时状态计算
+    assert data["matches_current_actuals"] is False
+    assert data["current_actual_version"] == 2
+    assert data["current_fingerprint"] != frozen_fingerprint
+
+
+def test_same_no_different_content_after_supersede_conflicts(client):
+    """取代后同交接号异内容重发仍 409（逐字段比对，与方案状态无关）。"""
+    plan = _finished_stack(client)
+    pid = plan["plan_id"]
+    h1 = client.post(f"/api/plans/{pid}/handovers", json=_handover_body())
+    assert h1.status_code == 201
+
+    _supersede(client, pid)
+
+    for key, altered in [
+        ("cutoff_minute", 40),
+        ("expected_actual_version", 2),
+        ("max_finish_delay_minutes", 9),
+    ]:
+        body = _handover_body()
+        body[key] = altered
+        rr = client.post(f"/api/plans/{pid}/handovers", json=body)
+        assert rr.status_code == 409, (key, rr.text)
+        assert "交接号" in rr.json()["detail"]
+    # 有效流水号集合不同 -> 409；集合相同仅顺序不同 -> 200
+    rr = client.post(f"/api/plans/{pid}/handovers",
+                     json=_handover_body(seqs=(1, 2, 3)))
+    assert rr.status_code == 409
+    rr = client.post(f"/api/plans/{pid}/handovers",
+                     json=_handover_body(seqs=(4, 3, 2, 1)))
+    assert rr.status_code == 200
+    assert len(client.get(f"/api/plans/{pid}/handovers").json()) == 1
+
+
+def test_cross_plan_reuse_after_supersede_conflicts(client):
+    """取代后把原交接号用于另一方案（跨方案复用）仍 409。"""
+    p1 = _finished_stack(client)
+    h1 = client.post(f"/api/plans/{p1['plan_id']}/handovers",
+                     json=_handover_body())
+    assert h1.status_code == 201
+
+    _supersede(client, p1["plan_id"])
+
+    other_slots = {
+        "slots": [
+            {"code": "C01", "stack": "C", "tier": 1, "capacity": 100, "arm": 2.0},
+            {"code": "D01", "stack": "D", "tier": 1, "capacity": 100, "arm": 2.0},
+        ],
+        "adjacency": [], "incompatible_classes": [],
+        "min_moment": -100000, "max_moment": 100000,
+    }
+    p2 = _confirm(client, other_slots, TWIN_MANIFEST)
+    pid2 = p2["plan_id"]
+    _schedule(client, pid2, crane_count=2, nos=("C001", "C003"), d1=10, d2=10)
+    client.post(f"/api/plans/{pid2}/actual-events", json={"events": [
+        _ev(1, "start", "C001", 1, 0),
+        _ev(2, "finish", "C001", 1, 10),
+        _ev(3, "start", "C003", 2, 0),
+        _ev(4, "finish", "C003", 2, 10),
+    ]})
+    r2 = client.post(f"/api/plans/{pid2}/handovers",
+                     json=_handover_body(seqs=(1, 2, 3, 4)))
+    assert r2.status_code == 409 and "另一方案" in r2.json()["detail"]
+    assert len(client.get(f"/api/plans/{p1['plan_id']}/handovers").json()) == 1
+
+
+def _supersede(client, pid):
+    """以新清单修订生成修订方案并确认，取代 pid；返回新方案响应体。"""
+    client.post("/api/manifest-revisions", json={
+        "containers": [{"no": "C001", "weight": 15, "hazmat": None,
+                        "discharge_order": 1}]
+    })
+    p2 = client.post(f"/api/plans/{pid}/amend", json={}).json()
+    ok = client.post(f"/api/plans/{p2['plan_id']}/confirm", json={
+        "slots_revision": p2["slots_revision"],
+        "manifest_revision": p2["manifest_revision"],
+    })
+    assert ok.status_code == 200, ok.text
+    return p2
 
 
 def test_expected_version_mismatch_conflict(client):

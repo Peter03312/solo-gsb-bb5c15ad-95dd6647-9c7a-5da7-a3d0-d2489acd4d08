@@ -3102,8 +3102,11 @@ def issue_loading_handover(
     每箱均在截止分钟前（含）完工且截止后无有效事件、逐箱按冻结排程基线计算的
     完工延误均不超过阈值的申请；任一业务条件不满足均不生成凭证。生成前在
     BEGIN IMMEDIATE 写事务内复核方案仍已确认、实绩版本及有效事件未变（指纹）。
-    同交接号同内容重试（即使其后实绩版本已被更正推进）返回原凭证；同交接号
-    异内容冲突（409）。返回 (凭证 ORM 对象, 是否幂等重试命中)。
+    同交接号同内容重试（即使其后方案已被新修订确认取代，或实绩版本已被更正
+    推进）返回原凭证；同交接号异内容或跨方案复用冲突（409）。判定顺序：
+    先处理同号凭证（命中 -> 200 原凭证；异内容/跨方案 -> 409），仅在交接号
+    尚未占用时才检查方案状态（未确认/已取代的新申请 -> 409）及其余签发条件。
+    返回 (凭证 ORM 对象, 是否幂等重试命中)。
     """
     expected_version = payload.expected_actual_version
     cutoff = payload.cutoff_minute
@@ -3125,7 +3128,10 @@ def issue_loading_handover(
     try:
         cursor.execute("BEGIN IMMEDIATE")
 
-        # 幂等/冲突优先：交接号全局唯一，先判定是否已有同号凭证
+        # 幂等/冲突最优先：交接号全局唯一，先判定是否已有同号凭证。
+        # 此判定先于方案状态检查——方案被新修订确认取代、或实绩后来被更正后，
+        # 现场用原交接号重发同一申请时，仍可取回已签发凭证（200），而不是
+        # 因旧方案状态先返回 409。
         cursor.execute(
             "SELECT id, plan_id, cutoff_minute, expected_actual_version, valid_seqs, "
             "max_finish_delay_minutes FROM loading_handovers WHERE handover_no = ?",
@@ -3133,21 +3139,11 @@ def issue_loading_handover(
         )
         existing = cursor.fetchone()
 
-        # 锁内复核：方案仍存在且仍已确认
-        cursor.execute("SELECT status, revision_no FROM plans WHERE id = ?", (plan_id,))
-        prow = cursor.fetchone()
-        if prow is None:
-            conn.rollback()
-            raise BusinessError(f"方案 {plan_id} 不存在", 404)
-        plan_status_locked, revision_no_locked = prow
-        if plan_status_locked != "confirmed":
-            conn.rollback()
-            raise ConflictError(
-                f"方案当前状态为 {plan_status_locked}：未确认或已被取代的方案"
-                "拒绝装船完结交接"
-            )
-
         if existing is not None:
+            # 交接号、方案、截止分钟、期望实绩版本、有效流水号集合、最大完工
+            # 延误阈值六项与首次签发全部一致 -> 幂等命中，直接返回原凭证，
+            # 不再评估方案状态/实绩版本/截止/延误等后续条件；凭证不可变内容
+            # 保持原样，“是否对应当前实绩”标记在响应组装时按查询时状态计算。
             same = (
                 existing[1] == plan_id
                 and existing[2] == cutoff
@@ -3167,6 +3163,22 @@ def issue_loading_handover(
             handover_pk = existing[0]
             conn.commit()
         else:
+            # 新申请：锁内复核方案仍存在且仍已确认（取代后的新交接申请 -> 409）
+            cursor.execute(
+                "SELECT status, revision_no FROM plans WHERE id = ?", (plan_id,)
+            )
+            prow = cursor.fetchone()
+            if prow is None:
+                conn.rollback()
+                raise BusinessError(f"方案 {plan_id} 不存在", 404)
+            plan_status_locked, revision_no_locked = prow
+            if plan_status_locked != "confirmed":
+                conn.rollback()
+                raise ConflictError(
+                    f"方案当前状态为 {plan_status_locked}：未确认或已被取代的方案"
+                    "拒绝装船完结交接"
+                )
+
             cursor.execute(
                 "SELECT id, version, baseline_crane_count FROM loading_actuals "
                 "WHERE plan_id = ?",
