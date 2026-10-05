@@ -3102,8 +3102,10 @@ def issue_loading_handover(
     每箱均在截止分钟前（含）完工且截止后无有效事件、逐箱按冻结排程基线计算的
     完工延误均不超过阈值的申请；任一业务条件不满足均不生成凭证。生成前在
     BEGIN IMMEDIATE 写事务内复核方案仍已确认、实绩版本及有效事件未变（指纹）。
-    同交接号同内容重试（即使其后实绩版本已被更正推进）返回原凭证；同交接号
-    异内容冲突（409）。返回 (凭证 ORM 对象, 是否幂等重试命中)。
+    判定顺序：交接号幂等/冲突优先于方案状态——同交接号且方案、截止分钟、期望
+    实绩版本、有效流水号集合与延误阈值均与首次签发一致的重试（即使方案此后被
+    取代或实绩已被更正）返回原凭证；同交接号异内容（含跨方案复用）冲突（409）；
+    无同号凭证的新申请才校验方案仍 confirmed。返回 (凭证 ORM 对象, 是否幂等重试命中)。
     """
     expected_version = payload.expected_actual_version
     cutoff = payload.cutoff_minute
@@ -3133,19 +3135,13 @@ def issue_loading_handover(
         )
         existing = cursor.fetchone()
 
-        # 锁内复核：方案仍存在且仍已确认
+        # 锁内复核：方案仍存在
         cursor.execute("SELECT status, revision_no FROM plans WHERE id = ?", (plan_id,))
         prow = cursor.fetchone()
         if prow is None:
             conn.rollback()
             raise BusinessError(f"方案 {plan_id} 不存在", 404)
         plan_status_locked, revision_no_locked = prow
-        if plan_status_locked != "confirmed":
-            conn.rollback()
-            raise ConflictError(
-                f"方案当前状态为 {plan_status_locked}：未确认或已被取代的方案"
-                "拒绝装船完结交接"
-            )
 
         if existing is not None:
             same = (
@@ -3162,11 +3158,19 @@ def issue_loading_handover(
                     + ("（属于另一方案）" if existing[1] != plan_id else "（内容不同）")
                     + "，同交接号异内容冲突，本次申请被拒绝且不生成新凭证"
                 )
-            # 同交接号同内容：重试，直接返回原凭证，不重新评估后续条件
+            # 同交接号同内容：重试，直接返回原凭证——即使方案此后被取代或实绩
+            # 被更正，也不再重新评估方案状态等后续条件
             idempotent_hit = True
             handover_pk = existing[0]
             conn.commit()
         else:
+            # 新签发：方案必须仍处于已确认状态（未确认或已被取代均拒绝）
+            if plan_status_locked != "confirmed":
+                conn.rollback()
+                raise ConflictError(
+                    f"方案当前状态为 {plan_status_locked}：未确认或已被取代的方案"
+                    "拒绝装船完结交接"
+                )
             cursor.execute(
                 "SELECT id, version, baseline_crane_count FROM loading_actuals "
                 "WHERE plan_id = ?",

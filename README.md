@@ -374,13 +374,13 @@ curl -s -X POST $BASE/plans/<plan_id>/remaining-forecast \
 ### 生成前写事务复核（不留旧快照）
 
 - 生成在 SQLite `BEGIN IMMEDIATE` **写事务内**再次复核：**方案仍已确认**、**实绩版本未变**、**有效事件未变（指纹一致）与流水号集合未变**；并发的实绩更正或补登若在提交前生效，本次申请返回 `409` 且不生成凭证，**绝不固化更正/补登前的旧快照**；
-- 同交接号同内容的**重试优先返回原凭证**（即使其后实绩版本已被更正推进，也不重新评估、不重复生效，返回 `200`）；同交接号**异内容冲突**（含把交接号复用于另一方案）→ `409`，不生成新凭证；
+- **判定顺序：交接号幂等/冲突优先于方案状态校验**——同交接号且方案、截止分钟、期望实绩版本、有效流水号集合与最大完工延误阈值均与首次签发一致的**重试优先返回原凭证**（即使方案此后已被新修订取代、或实绩已被更正推进，也不再重新评估，返回 `200`）；同交接号**异内容冲突**（含把交接号复用于另一方案）→ `409`，不生成新凭证；**无同号凭证的新申请**才校验方案仍为 `confirmed`（`draft`/`superseded` → `409`）；
 - 被拒绝的申请（422/409）**不占用交接号**：修正内容后可原号重试。
 
 ### 凭证不可变与后续查询
 
 - **后续实绩变化不改凭证**：凭证签发后的实绩更正/补登照常走原登记/更正接口，凭证内容保持签发时快照；查询时以 `matches_current_actuals`（当前实绩指纹是否与凭证指纹一致）、`current_actual_version`、`current_fingerprint` **标示凭证是否仍对应当前实绩**；
-- **历史凭证仍可读**：方案被新修订取代（`superseded`）后拒绝新交接（`409`），但其历史凭证仍可查询；
+- **历史凭证仍可读、可取回**：方案被新修订取代（`superseded`）后拒绝**新**交接申请（`409`），但其历史凭证仍可查询，且同交接号同内容重发仍返回 `200` 与原凭证（见下「本轮用法」）；
 - 查询：`GET /api/plans/{plan_id}/handovers`（列该方案全部凭证）、`GET /api/plans/{plan_id}/handovers/{handover_id}`（方案内查询，不属于该方案 → `404`）、`GET /api/handovers/{handover_id}`（按凭证号全局查询，未知凭证 → `404`）。
 
 ### 入参校验
@@ -401,6 +401,36 @@ curl -s -X POST $BASE/plans/<plan_id>/handovers \
 curl -s $BASE/plans/<plan_id>/handovers          # 该方案凭证列表
 curl -s $BASE/plans/<plan_id>/handovers/<hid>    # 方案内查询（404=不属于该方案）
 curl -s $BASE/handovers/<hid>                    # 按凭证号查询（含匹配标示）
+```
+
+### 本轮用法：方案被取代后按原交接号取回已签发凭证
+
+已签发凭证的方案被新修订确认取代（`superseded`）后，现场可用**原交接号重发同一申请**取回凭证：交接号、方案、截止分钟、期望实绩版本、有效流水号集合与最大完工延误阈值均与首次签发一致时，即使方案已取代或实绩后来更正，也返回 `200` 与原凭证；不可变签发内容保持原样，`matches_current_actuals`/`current_actual_version`/`current_fingerprint` 仍按**查询时**实绩状态计算。同号异内容或跨方案复用 → `409`；取代后的**新**交接申请（新交接号）仍 → `409` 且不生成凭证。
+
+```bash
+# 1) 方案确认、实绩登记完成后首次签发（201）
+curl -s -X POST $BASE/plans/<plan_id>/handovers \
+  -H 'Content-Type: application/json' -d @examples/handover.json
+# -> 201，记下 handover_id（如 7f3a...）与请求内容
+
+# 2) 舱单修订、新方案确认，原方案被取代
+curl -s -X POST $BASE/manifest-revisions -H 'Content-Type: application/json' -d @examples/containers.json
+curl -s -X POST $BASE/plans/<plan_id>/amend -H 'Content-Type: application/json' -d '{}'
+curl -s -X POST $BASE/plans/<new_plan_id>/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"slots_revision": 1, "manifest_revision": 2}'
+
+# 3) 现场用原交接号重发同一申请 -> 200 取回原凭证（不再因方案取代而 409）
+curl -s -X POST $BASE/plans/<plan_id>/handovers \
+  -H 'Content-Type: application/json' -d @examples/handover.json
+# -> 200，handover_id 与首次签发相同，不新增凭证
+
+# 4) 取代后的新交接申请（新交接号）仍被拒绝且不生成凭证
+curl -s -X POST $BASE/plans/<plan_id>/handovers \
+  -H 'Content-Type: application/json' \
+  -d '{"handover_no": "H-NEW", "cutoff_minute": 30, "expected_actual_version": 1,
+       "valid_seqs": [1, 2, 3, 4], "max_finish_delay_minutes": 5}'
+# -> 409 {"detail": "方案当前状态为 superseded：未确认或已被取代的方案拒绝装船完结交接"}
 ```
 
 ## 五之二、离港前封签核对与放行凭证

@@ -387,6 +387,82 @@ def test_superseded_plan_rejected_409_but_existing_cert_readable(client):
     assert g.json()["handover_id"] == hid
 
 
+def test_resend_same_request_after_supersede_returns_original(client):
+    """方案被新修订确认取代后，同交接号同内容重发返回 200 与原凭证。"""
+    plan = _finished_stack(client)
+    pid = plan["plan_id"]
+    h = client.post(f"/api/plans/{pid}/handovers", json=_handover_body())
+    assert h.status_code == 201
+    hid = h.json()["handover_id"]
+    frozen_fingerprint = h.json()["actuals_fingerprint"]
+
+    # 修订舱单并确认新方案 -> 原方案被取代
+    client.post("/api/manifest-revisions", json={
+        "containers": [{"no": "C001", "weight": 15, "hazmat": None,
+                        "discharge_order": 1}]
+    })
+    p2 = client.post(f"/api/plans/{pid}/amend", json={}).json()
+    ok = client.post(f"/api/plans/{p2['plan_id']}/confirm", json={
+        "slots_revision": 1, "manifest_revision": 2
+    })
+    assert ok.status_code == 200
+
+    # 现场用原交接号重发同一申请 -> 200 与原凭证，固化内容不变
+    r = client.post(f"/api/plans/{pid}/handovers", json=_handover_body())
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["handover_id"] == hid
+    assert data["actuals_fingerprint"] == frozen_fingerprint
+    assert data["matches_current_actuals"] is True
+    # 仍只有一条凭证
+    assert len(client.get(f"/api/plans/{pid}/handovers").json()) == 1
+
+    # 取代后同号异内容仍 409；新交接号的新申请仍 409 且不生成凭证
+    body = _handover_body()
+    body["cutoff_minute"] = 40
+    rr = client.post(f"/api/plans/{pid}/handovers", json=body)
+    assert rr.status_code == 409 and "交接号" in rr.json()["detail"]
+    r2 = client.post(f"/api/plans/{pid}/handovers", json=_handover_body("H-new"))
+    assert r2.status_code == 409 and "取代" in r2.json()["detail"]
+    assert len(client.get(f"/api/plans/{pid}/handovers").json()) == 1
+
+
+def test_resend_same_request_after_supersede_and_correction(client):
+    """方案被取代且实绩被更正后重发：仍返回原凭证，匹配标记按查询时计算。"""
+    plan = _finished_stack(client)
+    pid = plan["plan_id"]
+    h = client.post(f"/api/plans/{pid}/handovers", json=_handover_body())
+    assert h.status_code == 201
+    hid = h.json()["handover_id"]
+
+    # 先更正实绩（版本 2），再取代方案
+    cc = client.post(f"/api/plans/{pid}/actual-events/correction", json={
+        "seq": 4, "expected_version": 1, "request_id": "CORR-S",
+        "event": {"seq": 4, "event_type": "finish", "container_no": "C002",
+                  "crane_no": 2, "minute": 19},
+    })
+    assert cc.status_code == 201
+    client.post("/api/manifest-revisions", json={
+        "containers": [{"no": "C001", "weight": 15, "hazmat": None,
+                        "discharge_order": 1}]
+    })
+    p2 = client.post(f"/api/plans/{pid}/amend", json={}).json()
+    assert client.post(f"/api/plans/{p2['plan_id']}/confirm", json={
+        "slots_revision": 1, "manifest_revision": 2
+    }).status_code == 200
+
+    # 同交接号同内容重发 -> 200 原凭证；内容固化，但标示按查询时状态计算
+    r = client.post(f"/api/plans/{pid}/handovers", json=_handover_body())
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["handover_id"] == hid
+    assert data["actual_version"] == 1
+    c2 = next(c for c in data["containers"] if c["container_no"] == "C002")
+    assert c2["actual_finish_minute"] == 20  # 固化内容不随更正改变
+    assert data["matches_current_actuals"] is False
+    assert data["current_actual_version"] == 2
+
+
 def test_expected_version_mismatch_conflict(client):
     plan = _finished_stack(client)
     pid = plan["plan_id"]
